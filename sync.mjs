@@ -13,6 +13,50 @@ const hashPattern = /^([a-f0-9]{64})  (.+)\r?$/
 const reusable = ["runtime", "app/backend/node_modules"]
 const fullArchive = "MiaoshouAuto-win-x64.tar.gz"
 const appArchive = "MiaoshouAuto-win-x64-app.tar.gz"
+const appAssetPattern = /^MiaoshouAuto-win-x64-app-[a-f0-9]{64}\.tar\.gz$/
+const repo = "wuzhenbin/miaoshou-auto-desktop-releases"
+const gh = args => execFileSync("gh", [...args, "--repo", repo], { encoding: "utf8" })
+const published = () => JSON.parse(execFileSync("gh", ["api", "repos/" + repo + "/releases"], { encoding: "utf8" }))
+
+function shellRecords(manifest) {
+    return manifest.split("\n").filter(line => {
+        const path = line.slice(66)
+        return path === "launcher-inputs.sha256" || [...reusable, "desktop"].some(directory => path.startsWith(directory + "/"))
+    }).sort().join("\n")
+}
+
+async function compatibleBase(work, manifest) {
+    if (!manifest.split("\n").some(line => line.slice(66) === "launcher-inputs.sha256")) return
+    const releases = published()
+    if (!releases.length) return
+    const latest = JSON.parse(execFileSync("gh", ["api", "repos/" + repo + "/releases/latest"], { encoding: "utf8" }))
+    if (!releaseTagPattern.test(latest.tag_name)) return
+    const baseVersion = latest.tag_name.replace(/^sha256-/, "")
+    const baseAsset = latest.assets.find(asset => asset.name === appArchive)
+    if (!baseAsset || latest.immutable) return
+    gh(["release", "download", latest.tag_name, "--pattern", appArchive, "--dir", work])
+    const archive = join(work, appArchive)
+    if ("sha256:" + await digest(archive) !== baseAsset.digest) fail("GitHub 完整版本的业务包摘要不匹配")
+    const baseManifest = execFileSync("tar", ["-xOf", archive, "releases/" + baseVersion + "/release.sha256"],
+        { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 })
+    if (createHash("sha256").update(baseManifest).digest("hex") !== baseVersion) fail("GitHub 完整版本的清单摘要不匹配")
+    await rm(archive)
+    if (shellRecords(baseManifest) === shellRecords(manifest)) return latest
+}
+
+async function publishApp(base, attachment) {
+    const name = attachment.name
+    const localDigest = "sha256:" + await digest(attachment.path)
+    if (!base.assets.some(asset => asset.name === name)) gh(["release", "upload", base.tag_name, attachment.path])
+    const latest = JSON.parse(execFileSync("gh", ["api", "repos/" + repo + "/releases/latest"], { encoding: "utf8" }))
+    const current = latest.assets.filter(asset => appAssetPattern.test(asset.name) && asset.state === "uploaded")
+        .sort((a, b) => b.id - a.id)[0]
+    if (latest.id !== base.id || current?.name !== name || current.digest !== localDigest)
+        fail("GitHub 最新业务包校验失败")
+    for (const asset of latest.assets) {
+        if (asset.name !== name && appAssetPattern.test(asset.name)) gh(["release", "delete-asset", base.tag_name, asset.name, "--yes"])
+    }
+}
 
 function fail(message) {
     throw new Error(message)
@@ -91,9 +135,17 @@ async function main() {
     await mkdir(destinationRoot, { recursive: true })
     const work = await mkdtemp(join(destinationRoot, ".sync-"))
     const member = "releases/" + version
+    const publish = process.argv.includes("--publish")
+    let base
     try {
-        for (const name of [fullArchive, appArchive]) {
-            const appOnly = name === appArchive
+        if (publish && !process.argv.includes("--full")) {
+            base = await compatibleBase(work, await readFile(join(source, "release.sha256"), "utf8"))
+            if (base?.tag_name.replace(/^sha256-/, "") === version) return
+        }
+        const applicationName = base ? "MiaoshouAuto-win-x64-app-" + version + ".tar.gz" : appArchive
+        const names = base ? [applicationName] : [fullArchive, applicationName]
+        for (const name of names) {
+            const appOnly = name !== fullArchive
             const archive = join(work, name)
             const options = appOnly ? reusable.map(path => "--exclude=" + member + "/" + path) : []
             const members = appOnly ? [member] : ["MiaoshouAuto.exe", "update.cmd", "rollback.cmd", member]
@@ -104,14 +156,17 @@ async function main() {
             await verifyRelease(join(extracted, member), version, { appOnly })
             await rm(extracted, { recursive: true })
         }
-        for (const name of [fullArchive, appArchive]) await rename(join(work, name), join(destinationRoot, name))
+        for (const name of names) await rename(join(work, name), join(destinationRoot, name))
+        if (base) {
+            await publishApp(base, { name: applicationName, path: join(destinationRoot, applicationName) })
+            console.log("已发布 Windows 业务更新包：" + applicationName)
+            return
+        }
     } finally { await rm(work, { recursive: true, force: true }) }
     await writeFile(join(destinationRoot, "version"), version + "\n")
     console.log("Windows 完整包和业务更新包已准备：" + destinationRoot + "，共 " + details.fileCount + " 个完整版本文件")
-    if (process.argv.includes("--publish")) {
-        const repo = "wuzhenbin/miaoshou-auto-desktop-releases"
+    if (publish) {
         const tag = "sha256-" + version
-        const gh = args => execFileSync("gh", [...args, "--repo", repo], { encoding: "utf8" })
         const list = () => JSON.parse(gh(["release", "list", "--limit", "1000", "--json", "tagName,isLatest,isDraft,isPrerelease"]))
         const attachments = [fullArchive, appArchive].map(name => join(destinationRoot, name))
         if (!list().some(item => item.tagName === tag && item.isLatest)) {
