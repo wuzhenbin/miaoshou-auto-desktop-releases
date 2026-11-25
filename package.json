@@ -1,0 +1,11 @@
+{
+  "name": "miaoshou-auto-desktop-releases",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "sync": "node sync.mjs"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  }
+}
