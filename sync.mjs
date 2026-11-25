@@ -8,6 +8,7 @@ const repository = resolve(dirname(fileURLToPath(import.meta.url)))
 const sourceRoot = resolve(process.env.MIAOSHOU_AUTO_SOURCE ?? join(repository, "../miaoshou-auto"), "dist/desktop")
 const destinationRoot = join(repository, "dist")
 const versionPattern = /^[a-f0-9]{64}$/
+const releaseTagPattern = /^(?:sha256-)?[a-f0-9]{64}$/
 const hashPattern = /^([a-f0-9]{64})  (.+)\r?$/
 
 function fail(message) {
@@ -97,15 +98,16 @@ async function main() {
     console.log("Windows 正式发布附件已准备：" + join(destinationRoot, name) + "，共 " + details.fileCount + " 个版本文件")
     if (process.argv.includes("--publish")) {
         const repo = "wuzhenbin/miaoshou-auto-desktop-releases"
+        const tag = "sha256-" + version
         const gh = args => execFileSync("gh", [...args, "--repo", repo], { encoding: "utf8" })
         const list = () => JSON.parse(gh(["release", "list", "--limit", "1000", "--json", "tagName,isLatest,isDraft,isPrerelease"]))
-        if (!list().some(item => item.tagName === version && item.isLatest)) {
-            gh(["release", "create", version, join(destinationRoot, name), "--latest", "--title", "Windows x64 " + version.slice(0, 8), "--notes", "Windows x64 桌面客户端"])
+        if (!list().some(item => item.tagName === tag && item.isLatest)) {
+            gh(["release", "create", tag, join(destinationRoot, name), "--target", "main", "--latest", "--title", "Windows x64 " + version.slice(0, 8), "--notes", "Windows x64 桌面客户端"])
         }
         const published = list()
-        if (!published.some(item => item.tagName === version && item.isLatest)) fail("最新 Release 校验失败")
+        if (!published.some(item => item.tagName === tag && item.isLatest)) fail("最新 Release 校验失败")
         for (const item of published) {
-            if (item.tagName !== version && versionPattern.test(item.tagName) && !item.isDraft && !item.isPrerelease)
+            if (item.tagName !== tag && releaseTagPattern.test(item.tagName) && !item.isDraft && !item.isPrerelease)
                 gh(["release", "delete", item.tagName, "--cleanup-tag", "--yes"])
         }
     }
