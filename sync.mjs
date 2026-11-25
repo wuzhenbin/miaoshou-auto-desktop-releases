@@ -10,6 +10,9 @@ const destinationRoot = join(repository, "dist")
 const versionPattern = /^[a-f0-9]{64}$/
 const releaseTagPattern = /^(?:sha256-)?[a-f0-9]{64}$/
 const hashPattern = /^([a-f0-9]{64})  (.+)\r?$/
+const reusable = ["runtime", "app/backend/node_modules"]
+const fullArchive = "MiaoshouAuto-win-x64.tar.gz"
+const appArchive = "MiaoshouAuto-win-x64-app.tar.gz"
 
 function fail(message) {
     throw new Error(message)
@@ -36,7 +39,7 @@ async function collectFiles(root, current = "") {
     return result.sort()
 }
 
-async function verifyRelease(directory, version) {
+async function verifyRelease(directory, version, { appOnly = false } = {}) {
     const manifestPath = join(directory, "release.sha256")
     const manifestHash = await digest(manifestPath)
     if (manifestHash !== version) fail(`release.sha256 摘要不匹配：${version}`)
@@ -47,6 +50,7 @@ async function verifyRelease(directory, version) {
         const match = line.match(hashPattern)
         if (!match) fail(`release.sha256 格式无效：${line}`)
         if (expected.has(match[2])) fail(`release.sha256 存在重复路径：${match[2]}`)
+        if (appOnly && reusable.some(path => match[2].startsWith(path + "/"))) continue
         expected.set(match[2], match[1])
     }
 
@@ -86,23 +90,36 @@ async function main() {
     const details = await verifyRelease(source, version)
     await mkdir(destinationRoot, { recursive: true })
     const work = await mkdtemp(join(destinationRoot, ".sync-"))
-    const name = "MiaoshouAuto-win-x64.tar.gz"
+    const member = "releases/" + version
     try {
-        execFileSync("tar", ["-czf", join(work, name), "-C", sourceRoot, "MiaoshouAuto.exe", "update.cmd", "rollback.cmd", "releases/" + version], { stdio: "inherit" })
-        // Verify the actual archive produced, including files that changed during packaging.
-        execFileSync("tar", ["-xzf", join(work, name), "-C", work], { stdio: "inherit" })
-        await verifyRelease(join(work, "releases", version), version)
-        await rename(join(work, name), join(destinationRoot, name))
+        for (const name of [fullArchive, appArchive]) {
+            const appOnly = name === appArchive
+            const archive = join(work, name)
+            const options = appOnly ? reusable.map(path => "--exclude=" + member + "/" + path) : []
+            const members = appOnly ? [member] : ["MiaoshouAuto.exe", "update.cmd", "rollback.cmd", member]
+            execFileSync("tar", ["-czf", archive, ...options, "-C", sourceRoot, ...members], { stdio: "inherit" })
+            const extracted = join(work, appOnly ? "app" : "full")
+            await mkdir(extracted)
+            execFileSync("tar", ["-xzf", archive, "-C", extracted], { stdio: "inherit" })
+            await verifyRelease(join(extracted, member), version, { appOnly })
+            await rm(extracted, { recursive: true })
+        }
+        for (const name of [fullArchive, appArchive]) await rename(join(work, name), join(destinationRoot, name))
     } finally { await rm(work, { recursive: true, force: true }) }
     await writeFile(join(destinationRoot, "version"), version + "\n")
-    console.log("Windows 正式发布附件已准备：" + join(destinationRoot, name) + "，共 " + details.fileCount + " 个版本文件")
+    console.log("Windows 完整包和业务更新包已准备：" + destinationRoot + "，共 " + details.fileCount + " 个完整版本文件")
     if (process.argv.includes("--publish")) {
         const repo = "wuzhenbin/miaoshou-auto-desktop-releases"
         const tag = "sha256-" + version
         const gh = args => execFileSync("gh", [...args, "--repo", repo], { encoding: "utf8" })
         const list = () => JSON.parse(gh(["release", "list", "--limit", "1000", "--json", "tagName,isLatest,isDraft,isPrerelease"]))
+        const attachments = [fullArchive, appArchive].map(name => join(destinationRoot, name))
         if (!list().some(item => item.tagName === tag && item.isLatest)) {
-            gh(["release", "create", tag, join(destinationRoot, name), "--target", "main", "--latest", "--title", "Windows x64 " + version.slice(0, 8), "--notes", "Windows x64 桌面客户端"])
+            gh(["release", "create", tag, ...attachments, "--target", "main", "--latest", "--title", "Windows x64 " + version.slice(0, 8), "--notes", "Windows x64 桌面客户端"])
+        } else {
+            const { assets } = JSON.parse(gh(["release", "view", tag, "--json", "assets"]))
+            const missing = attachments.filter(path => !assets.some(asset => join(destinationRoot, asset.name) === path))
+            if (missing.length) gh(["release", "upload", tag, ...missing])
         }
         const published = list()
         if (!published.some(item => item.tagName === tag && item.isLatest)) fail("最新 Release 校验失败")
